@@ -3,7 +3,10 @@ use ignore::{
     WalkBuilder,
     overrides::{Override, OverrideBuilder},
 };
-use std::{collections::BTreeMap, fs::File, os::unix::fs::MetadataExt, path::PathBuf};
+use similar::TextDiff;
+use std::{
+    collections::BTreeMap, fmt::Display, fs::File, os::unix::fs::MetadataExt, path::PathBuf,
+};
 
 const MAX_DIFF_TEXT_SIZE: u64 = 100 * 1024; // 100KB
 
@@ -13,6 +16,22 @@ enum Kind {
     Dir,
     Symlink,
     Other,
+}
+
+impl Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Kind::File => "file",
+                Kind::Dir => "dir",
+                Kind::Symlink => "symlink",
+                Kind::Other => "other",
+            }
+        )?;
+        Ok(())
+    }
 }
 
 impl Kind {
@@ -33,6 +52,13 @@ impl Kind {
 struct Ownership {
     uid: u32,
     gid: u32,
+}
+
+impl Display for Ownership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.uid, self.gid)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -98,11 +124,88 @@ impl Entry {
             attrs,
         })
     }
+
+    fn text_diff(&self, other: &Entry) -> Vec<String> {
+        match (self.contents.as_deref(), other.contents.as_deref()) {
+            (Some(cont1), Some(cont2)) => TextDiff::from_lines(cont2, cont1)
+                .iter_all_changes()
+                .map(|change| {
+                    let sign = match change.tag() {
+                        similar::ChangeTag::Delete => "-",
+                        similar::ChangeTag::Insert => "+",
+                        similar::ChangeTag::Equal => " ",
+                    };
+                    format!("{sign}{change}")
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
 }
 
 type Snapshot = BTreeMap<PathBuf, Entry>;
 
-fn build_overrides(dir: &String, patterns: &Vec<String>) -> anyhow::Result<Override> {
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum DiffVerb {
+    Added,
+    Deleted,
+    Modified,
+}
+
+#[derive(Debug)]
+pub struct Diff {
+    path: PathBuf,
+    verb: DiffVerb,
+    old_attrs: Option<Attrs>,
+    new_attrs: Option<Attrs>,
+    text_diff: Vec<String>,
+}
+
+impl Display for Diff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mark = match self.verb {
+            DiffVerb::Added => "A",
+            DiffVerb::Deleted => "D",
+            DiffVerb::Modified => "M",
+        };
+
+        writeln!(f, "{mark} {}", self.path.display())?;
+
+        match (self.old_attrs.as_ref(), self.new_attrs.as_ref()) {
+            (Some(a1), Some(a2)) => {
+                if a1.kind != a2.kind {
+                    writeln!(f, "- File type changed from {} to {}", a1.kind, a2.kind)?;
+                }
+                if a1.mode != a2.mode {
+                    writeln!(f, "- File mode changed from {} to {}", a1.mode, a2.mode)?;
+                }
+                if a1.ownership != a2.ownership {
+                    writeln!(
+                        f,
+                        "- File ownership changed from {} to {}",
+                        a1.ownership, a2.ownership
+                    )?;
+                }
+                if a1.symlink_target != a2.symlink_target {
+                    writeln!(
+                        f,
+                        "- File symlink target changed from {} to {}",
+                        a1.symlink_target.as_ref().unwrap().display(), a2.symlink_target.as_ref().unwrap().display()
+                    )?;
+                }
+            }
+            _ => {}
+        };
+
+        for line in &self.text_diff {
+            write!(f, "{line}")?;
+        }
+
+        Ok(())
+    }
+}
+
+fn build_overrides(dir: &str, patterns: &[String]) -> anyhow::Result<Override> {
     let mut ob = OverrideBuilder::new(dir);
     for pattern in patterns {
         ob.add(&format!("!{pattern}"))?;
@@ -136,15 +239,57 @@ pub fn snapshot(
             Ok(e) => {
                 snapshot.insert(path, e);
             }
-            Err(e) => println!("whatchanged: {}: {e}", path.display()),
+            Err(e) => eprintln!("whatchanged: {}: {e}", path.display()),
         }
     }
 
     Ok(snapshot)
 }
 
-pub fn diff(snapshot_pre: &Snapshot, snapshot_post: &Snapshot) {
+pub fn diff(mut snapshot_pre: Snapshot, snapshot_post: &Snapshot) -> Vec<Diff> {
+    let mut diffs: Vec<Diff> = snapshot_post
+        .iter()
+        .filter_map(|(path, entry_post)| {
+            match snapshot_pre.remove(path) {
+                None => {
+                    // added
+                    Some(Diff {
+                        path: path.clone(),
+                        verb: DiffVerb::Added,
+                        old_attrs: None,
+                        new_attrs: None,
+                        text_diff: vec![],
+                    })
+                }
+                Some(entry_pre) => {
+                    // diff the entries here
+                    if entry_pre != *entry_post {
+                        Some(Diff {
+                            path: path.clone(),
+                            verb: DiffVerb::Modified,
+                            old_attrs: Some(entry_pre.attrs.clone()),
+                            new_attrs: Some(entry_post.attrs.clone()),
+                            text_diff: entry_post.text_diff(&entry_pre),
+                        })
+                    } else {
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
 
+    for (path, _) in snapshot_pre {
+        diffs.push(Diff {
+            path: path.clone(),
+            verb: DiffVerb::Deleted,
+            old_attrs: None,
+            new_attrs: None,
+            text_diff: vec![],
+        });
+    }
+
+    diffs
 }
 
 pub fn run(
@@ -153,11 +298,10 @@ pub fn run(
     _command: Vec<String>,
     hidden: bool,
 ) -> anyhow::Result<()> {
-
     let snapshot_pre = snapshot(&dir, &ignore, hidden)?;
     let snapshot_post = snapshot(&dir, &ignore, hidden)?;
 
-    diff(&snapshot_pre, &snapshot_post);
+    diff(snapshot_pre, &snapshot_post);
 
     Ok(())
 }
