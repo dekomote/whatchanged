@@ -20,5 +20,5 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    whatchanged::run(args.dir, args.ignore, args.command, args.hidden).expect("skdjfas;lkjf")
+    whatchanged::run(args.dir, args.ignore, args.command, args.hidden).expect("Error")
 }

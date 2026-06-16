@@ -5,7 +5,7 @@ use ignore::{
 };
 use similar::TextDiff;
 use std::{
-    collections::BTreeMap, fmt::Display, fs::File, os::unix::fs::MetadataExt, path::PathBuf,
+    collections::BTreeMap, fmt::Display, fs::File, os::unix::fs::MetadataExt, path::PathBuf, process::Command,
 };
 
 const MAX_DIFF_TEXT_SIZE: u64 = 100 * 1024; // 100KB
@@ -232,14 +232,17 @@ pub fn snapshot(
     let mut snapshot = Snapshot::new();
 
     for entry in walker {
-        let entry = entry?;
-        let path = entry.path().to_path_buf();
-
-        match Entry::from_path(path.clone()) {
-            Ok(e) => {
-                snapshot.insert(path, e);
+        match entry {
+            Ok(entry) => {
+                let path = entry.path().to_path_buf();
+                match Entry::from_path(path.clone()) {
+                    Ok(e) => {
+                        snapshot.insert(path, e);
+                    }
+                    Err(e) => eprintln!("whatchanged: {}: {e}", path.display()),
+                }
             }
-            Err(e) => eprintln!("whatchanged: {}: {e}", path.display()),
+            Err(e) => eprintln!("whatchanged: {e}"),
         }
     }
 
@@ -299,9 +302,16 @@ pub fn run(
     hidden: bool,
 ) -> anyhow::Result<()> {
     let snapshot_pre = snapshot(&dir, &ignore, hidden)?;
+    Command::new("touch").arg("vim.txt").status()?;
+    Command::new("sh")
+        .arg("-c")
+        .arg("echo asdfasfdsafsdfasdfasf > 2.txt")
+        .status()?;
     let snapshot_post = snapshot(&dir, &ignore, hidden)?;
 
-    diff(snapshot_pre, &snapshot_post);
+    for diff in diff(snapshot_pre, &snapshot_post) {
+        println!("{}", diff);
+    }
 
     Ok(())
 }
